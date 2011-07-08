@@ -1,0 +1,6 @@
+
+iscpc - client for iscp server over ethernet
+
+A simple program to send ISCP commands from standard input to an
+Onkyo / Integra receiver over ethernet. 
+

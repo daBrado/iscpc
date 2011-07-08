@@ -1,0 +1,171 @@
+#!/usr/bin/env python
+#
+# Integra Serial Communication Protocol Client
+#
+
+from __future__ import print_function
+import argparse
+import socket
+import select
+import struct
+import sys
+import signal
+import os
+import errno
+import time
+
+
+class Message(object):
+  @classmethod
+  def ethernet_packet_scan(cls, string):
+    index = string.find('ISCP')
+    if index == -1:
+      return None, string 
+    string = string[index:]
+    if len(string) < 12:
+      return None, string
+    banner = string[0:4]
+    header_size = struct.unpack('!i', string[4:8])[0]
+    data_size = struct.unpack('!i', string[8:12])[0]
+    if len(string) < header_size + data_size:
+      return None, string
+    version = ord(string[12])
+    reserved = string[13:header_size]
+    data = string[header_size:header_size+data_size]
+    string = string[header_size+data_size:]
+    unit = data[1]
+    message = data[2:].rstrip(chr(0x0a)+chr(0x0d)+chr(0x1a))
+    return cls(message[0:3], message[3:]), string
+  def __init__(self, command, parameter):
+    self.command = command.encode('ascii')[0:3]
+    self.parameter = parameter.encode('ascii')
+  def packet(self):
+    data = '!' + '1' + self.command + self.parameter + chr(0x0a)
+    header = 'ISCP' + \
+             struct.pack('!i', 16) + \
+             struct.pack('!i', len(data)) + \
+             chr(1) + \
+             chr(0)+chr(0)+chr(0)
+    return bytearray(header+data, 'ascii')
+  def __str__(self):
+    return self.command + self.parameter
+  def __repr__(self):
+    return '{ISCP %s %s}' % (self.command, self.parameter)
+
+
+class Pipe(object):
+  def __init__(self):
+    (self.read, self.write) = os.pipe()
+
+
+class Alarms(object):
+  def __init__(self):
+    self._alarms = {}
+  def add(self, time, action):
+    self[float(time)] = action
+  def timeout(self):
+    if self._alarms:
+      return self._alarms.keys()[0] - time.time()
+    else:
+      return None
+  def do(self):
+    for t,action in self._alarms:
+      if t <= time.time():
+        action()
+      else:
+        break
+
+
+class ISCPClient(object):
+  def __init__(self):
+    parser = argparse.ArgumentParser(description='Talk to an ISCP server on standard input.')
+    parser.add_argument('host', help='Hostname or address of ISCP server')
+    parser.add_argument('port', nargs='?', default=60128, type=int,
+                        help='ISCP server port (default is 60128)')
+    parser.add_argument('-e', '--exit', action='append',
+                        help='Exit on given type of server response')
+    parser.add_argument('-w', '--wait', default=-1, type=float,
+                        help='Wait given seconds before exitting after last message. Negative value means wait forever (default)')
+    parser.add_argument('-i', '--interval', default=0.05, type=float,
+                        help='Minimum interval between messages to server in seconds (default is 0.05)')
+    args = parser.parse_args(namespace=self)
+    self.signals = []
+    self.pipe = None
+    self.socket = None
+    self.msg_queue = []
+    self.rlist = [sys.stdin]
+    self.last_msg_time = time.time() - self.interval
+  def _connect(self):
+    self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+      self.socket.connect((self.host, self.port))
+    except socket.error as e:
+      print('Connection failed: %s' % e.strerror, file=sys.stderr)
+      sys.exit(e.errno)
+    self.rlist.append(self.socket)
+  def _catch_signals(self):
+    self.pipe = Pipe()
+    signal.set_wakeup_fd(self.pipe.write)
+    signal.signal(signal.SIGINT, lambda s,f: self.signals.append(s))
+    signal.signal(signal.SIGPIPE, lambda s,f: self.signals.append(s))
+    self.rlist.append(self.pipe.read)
+  def _get_timeout(self):
+    if self.msg_queue:
+      return self.interval - (time.time() - self.last_msg_time)
+    elif sys.stdin not in self.rlist and self.wait >= 0:
+      return (self.last_msg_time + self.wait) - time.time()
+    else:
+      return None
+  def run(self):
+    self._connect()
+    self._catch_signals()
+    buf = ''
+    while self.socket in self.rlist and \
+          not self.signals and \
+          not (not self.msg_queue and self.wait >= 0 and (time.time() - self.last_msg_time) >= self.wait):
+      try:
+        rsel,_,_ = select.select(self.rlist, (), (), self._get_timeout())
+      except select.error as err:
+        if err[0] == errno.EINTR:
+          # Probably raised due to signal handling
+          continue
+        else:
+          raise
+      # Handle messages from server
+      if self.socket in rsel:
+        new = self.socket.recv(1024)
+        if new:
+          buf += new
+          message,buf = Message.ethernet_packet_scan(buf)
+          if message is not None:
+            print(str(message))
+            if self.exit and message.command in self.exit:
+              self.rlist.remove(self.socket)
+            try:
+              sys.stdout.flush()
+            except IOError as e:
+              print(e.strerror, file=sys.stderr)
+              sys.exit(e.errno)
+              pass
+        else:
+          self.rlist.remove(self.socket)
+      # Queue up messages from client
+      if sys.stdin in rsel:
+        cmd = sys.stdin.readline()
+        if cmd:
+          cmd = cmd.strip()
+          self.msg_queue.append(Message(cmd[0:3], cmd[3:]))
+        else:
+          self.rlist.remove(sys.stdin)
+      # Send queued messages to server
+      if self.msg_queue and (time.time() - self.last_msg_time) > self.interval:
+        self.socket.sendall(self.msg_queue.pop(0).packet())
+        self.last_msg_time = time.time()
+
+
+def main():
+  ISCPClient().run()
+  
+
+if __name__ == "__main__":
+  main()
